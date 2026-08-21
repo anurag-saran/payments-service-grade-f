@@ -1,0 +1,165 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: run-tests-maven
+spec:
+  description: >-
+    Real-app replacement for upgrade-delta-run-tests (which is tied to the
+    demo's fixture jars and a bespoke MiniRunner class). This task runs the
+    ACTUAL test suite for real, via Maven Surefire, filtered by the
+    surefire-includes.txt file upgrade-delta-select-tests already writes --
+    that file is in Surefire's own native <includesFile> format
+    (one test class per line), so select-tests needs no changes at all.
+  params:
+    - name: app-module-dir
+      type: string
+      default: "."
+  workspaces:
+    - name: source
+    - name: maven-settings
+      description: Secret volume with settings.xml (Lightwell server credentials)
+  results:
+    - name: TEST_METHODS_PASSED_COUNT
+      description: "Test METHODS that were EXECUTED and passed"
+    - name: TEST_METHODS_FAILED_COUNT
+      description: "Test METHODS that were executed and FAILED. 0 = all green."
+    - name: TESTS_ACTUALLY_EXECUTED_SUMMARY
+      description: "One human-readable sentence confirming tests were run for real"
+  steps:
+    - name: run
+      displayName: "RUN the selected tests for real (Maven Surefire)"
+      image: registry.access.redhat.com/ubi9/openjdk-21:latest
+      workingDir: $(workspaces.source.path)
+      script: |
+        #!/usr/bin/env bash
+        set -uo pipefail
+        SETTINGS="$(workspaces.maven-settings.path)/settings.xml"
+        INCLUDES="$(workspaces.source.path)/out/routing-out/surefire-includes.txt"
+        SEL="$(workspaces.source.path)/out/routing-out/selection-report.json"
+        [ -f "$INCLUDES" ] || { echo "FATAL: $INCLUDES not found -- did select-tests run first?"; exit 1; }
+
+        # Empty suite / REACHABILITY_ONLY: skip Surefire; do not claim a green pass.
+        if [ -f "$SEL" ] && python3 - "$SEL" <<'PY'
+        import json, sys
+        r = json.load(open(sys.argv[1]))
+        mode = (r.get("mode") or "")
+        suite = (r.get("totals") or {}).get("suite", 0)
+        sys.exit(0 if mode == "REACHABILITY_ONLY" or suite == 0 else 1)
+        PY
+        then
+          MSG="No test suite — reachability-only validation; Surefire skipped. Canary is the compensating control."
+          echo "$MSG"
+          printf '%s' "0" > "$(results.TEST_METHODS_PASSED_COUNT.path)"
+          printf '%s' "0" > "$(results.TEST_METHODS_FAILED_COUNT.path)"
+          printf '%s' "$MSG" > "$(results.TESTS_ACTUALLY_EXECUTED_SUMMARY.path)"
+          UD=".upgrade-delta/upgrade_delta.py"
+          [ -f "$UD" ] || UD="upgrade_delta.py"
+          RT_ARGS=(record-test-results --out out/test-results.json --passed 0 --failed 0
+                   --summary "$MSG" --status reachability_only
+                   --selection "$SEL" --scorecard out/scorecard.json)
+          [ -f out/routing.json ] && RT_ARGS+=(--routing out/routing.json)
+          python3 "$UD" "${RT_ARGS[@]}"
+          exit 0
+        fi
+
+        MVN_ARGS=(-B -s "$SETTINGS" test "-Dsurefire.includesFile=$INCLUDES")
+        # Prefer -Pci-community when present so demo runs don't need a working
+        # authenticated Lightwell settings.xml (stale PAT → 403 on rhlw pins).
+        if grep -q '<id>ci-community</id>' "$(params.app-module-dir)/pom.xml" 2>/dev/null; then
+          MVN_ARGS+=(-Pci-community)
+          echo "using -Pci-community (Maven Central) for Surefire"
+        fi
+        (
+          cd "$(params.app-module-dir)"
+          mvn "${MVN_ARGS[@]}"
+        )
+        MVN_RC=$?
+        # Sum every surefire-reports/*.txt summary line across all modules --
+        # more robust than parsing a single console summary line. Also cross-checks
+        # Maven's exit code: if Maven failed, or produced no reports at all, this
+        # must NOT report success -- a build that never ran the tests is a failure,
+        # not "0 failures".
+        python3 - "$(params.app-module-dir)" "$MVN_RC" <<'PY'
+        import glob, re, sys, os, json, subprocess
+        base, mvn_rc = sys.argv[1], int(sys.argv[2])
+        total_run = total_fail = total_err = 0
+        reports = glob.glob(f"{base}/**/surefire-reports/*.txt", recursive=True)
+        pat = re.compile(r"Tests run:\s*(\d+),\s*Failures:\s*(\d+),\s*Errors:\s*(\d+)")
+        for f in reports:
+            m = pat.search(open(f, errors="replace").read())
+            if m:
+                run, fail, err = (int(x) for x in m.groups())
+                total_run += run; total_fail += fail; total_err += err
+        failed = total_fail + total_err
+
+        failed_names = []
+        for xf in glob.glob(f"{base}/**/surefire-reports/TEST-*.xml", recursive=True):
+            try:
+                text = open(xf, errors="replace").read()
+            except OSError:
+                continue
+            for m in re.finditer(
+                    r'<(?:failure|error)\b[^>]*>.*?</(?:failure|error)>|'
+                    r'<testcase\b([^>]*?)\s+name="([^"]+)"([^>]*?)>',
+                    text, re.S):
+                pass
+            for m in re.finditer(
+                    r'<testcase\b[^>]*?\bclassname="([^"]+)"[^>]*?\bname="([^"]+)"[^>]*>'
+                    r'(?:(?!</testcase>).)*?<(?:failure|error)\b',
+                    text, re.S):
+                cls = m.group(1).rsplit(".", 1)[-1]
+                failed_names.append(f"{cls}.{m.group(2)}")
+            for m in re.finditer(
+                    r'<testcase\b[^>]*?\bname="([^"]+)"[^>]*?\bclassname="([^"]+)"[^>]*>'
+                    r'(?:(?!</testcase>).)*?<(?:failure|error)\b',
+                    text, re.S):
+                cls = m.group(2).rsplit(".", 1)[-1]
+                name = f"{cls}.{m.group(1)}"
+                if name not in failed_names:
+                    failed_names.append(name)
+
+        if mvn_rc != 0:
+            msg = (f"Maven FAILED (exit {mvn_rc}) -- the test suite did not complete. "
+                   f"{total_run} test method(s) had been recorded before the failure. "
+                   f"Treat this as a failed gate, not a pass.")
+            passed_count = 0
+            failed_count = max(failed, 1)
+        elif not reports:
+            msg = ("Maven completed but produced NO surefire reports -- 0 tests actually "
+                   "ran. This is not a pass; check that the selected tests exist and that "
+                   "the includes file matched them.")
+            passed_count = 0
+            failed_count = 0
+        elif failed == 0:
+            msg = f"Ran {total_run} test method(s) for real via Maven Surefire -- all passed, 0 failed."
+            passed_count, failed_count = total_run, 0
+        else:
+            msg = f"Ran {total_run} test method(s) for real via Maven Surefire -- {failed} FAILED."
+            passed_count, failed_count = total_run - failed, failed
+
+        open("$(results.TEST_METHODS_PASSED_COUNT.path)", "w").write(str(passed_count))
+        open("$(results.TEST_METHODS_FAILED_COUNT.path)", "w").write(str(failed_count))
+        open("$(results.TESTS_ACTUALLY_EXECUTED_SUMMARY.path)", "w").write(msg)
+        print(msg)
+
+        ud = ".upgrade-delta/upgrade_delta.py" if os.path.isfile(".upgrade-delta/upgrade_delta.py") \
+            else "upgrade_delta.py"
+        cmd = [sys.executable, ud, "record-test-results",
+               "--out", "out/test-results.json",
+               "--passed", str(passed_count), "--failed", str(failed_count),
+               "--summary", msg, "--status", "ran",
+               "--selection", "out/routing-out/selection-report.json",
+               "--scorecard", "out/scorecard.json"]
+        if os.path.isfile("out/routing.json"):
+            cmd += ["--routing", "out/routing.json"]
+        for cov in ("target/jacoco-per-test-coverage.json",
+                    "examples/tests/coverage.json"):
+            if os.path.isfile(cov):
+                cmd += ["--coverage", cov]
+                break
+        for n in failed_names:
+            cmd += ["--failed-name", n]
+        subprocess.check_call(cmd)
+        PY
+        # a genuine test failure (or a build failure) turns the PipelineRun red
+        exit $MVN_RC

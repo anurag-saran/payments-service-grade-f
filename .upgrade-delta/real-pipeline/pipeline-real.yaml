@@ -1,0 +1,304 @@
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: upgrade-delta-live
+spec:
+  description: >-
+    Lives in the APPLICATION'S OWN repo. Triggered on every PR: diffs
+    pom.xml (with Maven ${property} resolution) to find every dependency
+    version this PR changed, fetches the real old/new jars (Central vs
+    Lightwell by version string), runs analyze into a live evidence dir,
+    then scan grades the real impact on the real app. Also covers
+    Lightwell (rhlw) adoptions — e.g. jackson-databind 2.13.4 →
+    2.13.4.rhlw-00001. If the PR changes no dependency versions, this
+    passes through cleanly with an empty scorecard.
+  params:
+    - name: git-url
+      type: string
+    - name: git-revision
+      type: string
+      default: main
+    - name: target-branch
+      type: string
+      description: The PR's base branch (PaC provides this as {{ target_branch }})
+    - name: pom-path
+      type: string
+      default: pom.xml
+    - name: app-name
+      type: string
+    - name: app-module-dir
+      type: string
+      default: "."
+    - name: fail-on
+      type: string
+      default: "D"
+      description: >-
+        Fail the PipelineRun when the project grade is this bad or worse.
+        Applied AFTER tests run (grade-gate task) so scorecard.html still gets
+        pass/fail outcomes. Early scan/transitive tasks use an empty fail-on.
+    - name: accept-transitive-scope
+      type: string
+      default: "false"
+      description: >-
+        Sign off on de-escalating a transitive dependency whose changed
+        members are all unreachable through the app's call paths into the
+        parent. Default "false" -- nothing gets silently de-escalated.
+    - name: coverage-map
+      type: string
+      default: "target/jacoco-per-test-coverage.json"
+      description: >-
+        REAL per-test JaCoCo coverage map. If this file doesn't exist yet,
+        select-tests correctly fails open to the full suite.
+    - name: tests-dir
+      type: string
+      default: "src/test/java"
+    - name: repo-owner
+      type: string
+    - name: repo-name
+      type: string
+    - name: pull-request-number
+      type: string
+    - name: scorecard-route-host
+      type: string
+      default: ""
+    - name: auto-close-pr
+      type: string
+      default: "false"
+      description: >-
+        When "true", close the PR without merging after the CAB comment if
+        detect-pom-changes found a real version bump. Keeps main on community
+        libs for the next live demo cycle. Leave "false" for real app repos.
+    - name: enable-canary
+      type: string
+      default: "true"
+      description: >-
+        After CAB signoff, build an image and run progressive Route canary
+        (1→5→10→25→50→75→100%). Set "false" to skip CD on clusters without
+        payments-service Deployments/Route.
+    - name: canary-namespace
+      type: string
+      default: "upgrade-delta-demo"
+    - name: canary-soak-seconds
+      type: string
+      default: "30"
+    - name: cab-timeout-seconds
+      type: string
+      default: "1800"
+  workspaces:
+    - name: source
+    - name: maven-settings
+      description: Secret volume with settings.xml (Lightwell server credentials)
+    - name: basic-auth
+      description: PaC-provided git auth secret, for posting the CAB comment. Optional.
+      optional: true
+  tasks:
+    - name: clone
+      displayName: "1. Clone this PR's real source"
+      taskRef: {name: git-clone}
+      workspaces: [{name: output, workspace: source}]
+      params:
+        - {name: url, value: $(params.git-url)}
+        - {name: revision, value: $(params.git-revision)}
+
+    - name: detect-pom-changes
+      displayName: "2. Diff pom.xml for dependency version changes"
+      runAfter: [clone]
+      taskRef: {name: detect-pom-changes}
+      workspaces:
+        - {name: source, workspace: source}
+        - {name: basic-auth, workspace: basic-auth}
+      params:
+        - {name: target-branch, value: $(params.target-branch)}
+        - {name: pom-path, value: $(params.pom-path)}
+
+    - name: live-coverage
+      displayName: "3. Coverage meter on the real pom.xml"
+      runAfter: [detect-pom-changes]
+      taskRef: {name: live-coverage}
+      workspaces: [{name: source, workspace: source}]
+      params:
+        - {name: pom-path, value: $(params.pom-path)}
+        - {name: app-name, value: $(params.app-name)}
+
+    - name: generate-evidence
+      displayName: "4. Fetch jars, analyze each bump, scan"
+      runAfter: [live-coverage]
+      when:
+        - input: $(tasks.detect-pom-changes.results.HAS_CHANGE)
+          operator: in
+          values: ["true"]
+      taskRef: {name: generate-evidence}
+      workspaces:
+        - {name: source, workspace: source}
+        - {name: maven-settings, workspace: maven-settings}
+      params:
+        - {name: app-module-dir, value: $(params.app-module-dir)}
+        # Empty: do not fail here — grade-gate after tests keeps the run red
+        # while still letting select/run populate scorecard test outcomes.
+        - {name: fail-on, value: ""}
+
+    - name: grade-transitive
+      displayName: "5. Find + grade transitives the bump silently pulled in"
+      runAfter: [generate-evidence]
+      when:
+        - input: $(tasks.detect-pom-changes.results.HAS_CHANGE)
+          operator: in
+          values: ["true"]
+      taskRef: {name: resolve-and-grade-transitive}
+      workspaces:
+        - {name: source, workspace: source}
+        - {name: maven-settings, workspace: maven-settings}
+      params:
+        - {name: group, value: $(tasks.detect-pom-changes.results.CHANGED_GROUP)}
+        - {name: artifact, value: $(tasks.detect-pom-changes.results.CHANGED_ARTIFACT)}
+        - {name: old-version, value: $(tasks.detect-pom-changes.results.CHANGED_OLD_VERSION)}
+        - {name: new-version, value: $(tasks.detect-pom-changes.results.CHANGED_NEW_VERSION)}
+        - {name: app-jar, value: $(tasks.generate-evidence.results.APP_JAR)}
+        - {name: accept-transitive-scope, value: $(params.accept-transitive-scope)}
+        - {name: fail-on, value: ""}
+
+    - name: select-tests
+      displayName: "6. Pick which tests this upgrade owes"
+      runAfter: [grade-transitive]
+      when:
+        - input: $(tasks.detect-pom-changes.results.HAS_CHANGE)
+          operator: in
+          values: ["true"]
+      taskRef: {name: upgrade-delta-select-tests}
+      workspaces: [{name: source, workspace: source}]
+      params:
+        - {name: coverage-map, value: $(params.coverage-map)}
+        - {name: tests-dir, value: $(params.tests-dir)}
+        - {name: head-sha, value: $(params.git-revision)}
+
+    - name: run-tests
+      displayName: "7. RUN the selected tests for real (Maven Surefire)"
+      runAfter: [select-tests]
+      when:
+        - input: $(tasks.detect-pom-changes.results.HAS_CHANGE)
+          operator: in
+          values: ["true"]
+      taskRef: {name: run-tests-maven}
+      workspaces:
+        - {name: source, workspace: source}
+        - {name: maven-settings, workspace: maven-settings}
+      params:
+        - {name: app-module-dir, value: $(params.app-module-dir)}
+
+    - name: grade-gate
+      displayName: "7b. Enforce project grade gate (after tests)"
+      runAfter: [run-tests]
+      when:
+        - input: $(tasks.detect-pom-changes.results.HAS_CHANGE)
+          operator: in
+          values: ["true"]
+      taskSpec:
+        params:
+          - {name: fail-on, type: string}
+        steps:
+          - name: gate
+            image: registry.access.redhat.com/ubi9/python-311:latest
+            workingDir: $(workspaces.source.path)
+            script: |
+              #!/usr/bin/env bash
+              set -euo pipefail
+              FAIL_ON="$(params.fail-on)"
+              [ -n "$FAIL_ON" ] || { echo "fail-on empty — skipping grade gate"; exit 0; }
+              python3 - <<PY
+              import json, sys
+              order = ["A", "B", "C", "D", "F"]
+              sc = json.load(open("out/scorecard.json"))
+              grade = sc["project"].get("headline_grade") or "-"
+              fail_on = "$FAIL_ON"
+              if grade == "-" or grade not in order or fail_on not in order:
+                  print(f"grade={grade} fail-on={fail_on} — nothing to gate")
+                  sys.exit(0)
+              if order.index(grade) >= order.index(fail_on):
+                  print(f"GATE: project grade {grade} breaches --fail-on {fail_on}")
+                  sys.exit(2)
+              print(f"grade={grade} within fail-on={fail_on}")
+              PY
+        workspaces:
+          - {name: source}
+      workspaces: [{name: source, workspace: source}]
+      params:
+        - {name: fail-on, value: $(params.fail-on)}
+
+    - name: cab-decision
+      displayName: "7c. CAB decision (A/B auto · C+ human)"
+      runAfter: [grade-gate]
+      when:
+        - input: $(tasks.detect-pom-changes.results.HAS_CHANGE)
+          operator: in
+          values: ["true"]
+      taskRef: {name: cab-decision}
+      workspaces: [{name: source, workspace: source}]
+      params:
+        - {name: timeout-seconds, value: $(params.cab-timeout-seconds)}
+
+    - name: build-image
+      displayName: "7d. Build payments-service canary image"
+      runAfter: [cab-decision]
+      when:
+        - input: $(tasks.detect-pom-changes.results.HAS_CHANGE)
+          operator: in
+          values: ["true"]
+        - input: $(params.enable-canary)
+          operator: in
+          values: ["true"]
+        - input: $(tasks.cab-decision.results.CAB_APPROVED)
+          operator: in
+          values: ["true"]
+      taskRef: {name: build-payments-image}
+      workspaces: [{name: source, workspace: source}]
+      params:
+        - {name: namespace, value: $(params.canary-namespace)}
+        - {name: revision-tag, value: $(params.git-revision)}
+
+    - name: canary-rollout
+      displayName: "7e. Progressive canary 1%→100%"
+      runAfter: [build-image]
+      when:
+        - input: $(tasks.detect-pom-changes.results.HAS_CHANGE)
+          operator: in
+          values: ["true"]
+        - input: $(params.enable-canary)
+          operator: in
+          values: ["true"]
+        - input: $(tasks.cab-decision.results.CAB_APPROVED)
+          operator: in
+          values: ["true"]
+      taskRef: {name: canary-rollout}
+      workspaces: [{name: source, workspace: source}]
+      params:
+        - {name: image, value: $(tasks.build-image.results.IMAGE_DIGEST)}
+        - {name: namespace, value: $(params.canary-namespace)}
+        - {name: soak-seconds, value: $(params.canary-soak-seconds)}
+
+  finally:
+    - name: summary
+      displayName: "8. Print the verdict banner"
+      taskRef: {name: upgrade-delta-summary}
+      workspaces: [{name: source, workspace: source}]
+      params:
+        - {name: scorecard-route-host, value: $(params.scorecard-route-host)}
+    - name: pr-comment
+      displayName: "9. Post CAB comment + test plan to the PR"
+      taskRef: {name: upgrade-delta-pr-comment}
+      workspaces:
+        - {name: source, workspace: source}
+        - {name: basic-auth, workspace: basic-auth}
+      params:
+        - {name: source-label, value: "\u2705 **LIVE ANALYSIS** \u2014 real jars fetched and graded for THIS PR's pom.xml version changes."}
+        - {name: repo-owner, value: $(params.repo-owner)}
+        - {name: repo-name, value: $(params.repo-name)}
+        - {name: pull-request-number, value: $(params.pull-request-number)}
+        - {name: auto-close-pr, value: $(params.auto-close-pr)}
+
+  results:
+    - {name: VERSION_CHANGES_COUNT, value: $(tasks.detect-pom-changes.results.VERSION_CHANGES_COUNT)}
+    - {name: LIGHTWELL_ADOPTIONS_COUNT, value: $(tasks.detect-pom-changes.results.LIGHTWELL_ADOPTIONS_COUNT)}
+    - {name: COVERAGE_PCT_EXACT_MATCH, value: $(tasks.live-coverage.results.COVERAGE_PCT_EXACT_MATCH)}
+    - {name: PROJECT_GRADE_RECOMMENDED_PATH, value: $(tasks.generate-evidence.results.PROJECT_GRADE_RECOMMENDED_PATH)}
+    - {name: EVIDENCE_COUNT, value: $(tasks.generate-evidence.results.EVIDENCE_COUNT)}
+    - {name: TRANSITIVE_CHANGES_COUNT, value: $(tasks.grade-transitive.results.TRANSITIVE_CHANGES_COUNT)}

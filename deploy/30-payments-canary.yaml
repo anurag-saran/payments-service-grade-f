@@ -1,0 +1,157 @@
+# Baseline + canary Deployments, Services, and a weighted Route for progressive
+# traffic shifting (1% → … → 100%). Apply once to the demo namespace:
+#   oc apply -f deploy/30-payments-canary.yaml -n upgrade-delta-demo
+#
+# The canary Tekton task updates the canary Deployment image and Route weights.
+apiVersion: v1
+kind: Service
+metadata:
+  name: payments-stable
+  labels:
+    app.kubernetes.io/part-of: payments-service
+    app.kubernetes.io/name: payments-stable
+spec:
+  selector:
+    app: payments-service
+    track: stable
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: payments-canary
+  labels:
+    app.kubernetes.io/part-of: payments-service
+    app.kubernetes.io/name: payments-canary
+spec:
+  selector:
+    app: payments-service
+    track: canary
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payments-stable
+  labels:
+    app.kubernetes.io/part-of: payments-service
+    track: stable
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: payments-service
+      track: stable
+  template:
+    metadata:
+      labels:
+        app: payments-service
+        track: stable
+    spec:
+      containers:
+        - name: app
+          # Placeholder until the first successful canary promotes an image.
+          image: image-registry.openshift-image-registry.svc:5000/upgrade-delta-demo/payments-service:stable
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+              name: http
+          env:
+            - name: PORT
+              value: "8080"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 50m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payments-canary
+  labels:
+    app.kubernetes.io/part-of: payments-service
+    track: canary
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      app: payments-service
+      track: canary
+  template:
+    metadata:
+      labels:
+        app: payments-service
+        track: canary
+    spec:
+      containers:
+        - name: app
+          image: image-registry.openshift-image-registry.svc:5000/upgrade-delta-demo/payments-service:canary
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8080
+              name: http
+          env:
+            - name: PORT
+              value: "8080"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 50m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+---
+# Alternate backends: stable (weight 100) + canary (weight 0) initially.
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: payments-service
+  labels:
+    app.kubernetes.io/part-of: payments-service
+  annotations:
+    haproxy.router.openshift.io/balance: roundrobin
+spec:
+  to:
+    kind: Service
+    name: payments-stable
+    weight: 100
+  alternateBackends:
+    - kind: Service
+      name: payments-canary
+      weight: 0
+  port:
+    targetPort: http
+  wildcardPolicy: None

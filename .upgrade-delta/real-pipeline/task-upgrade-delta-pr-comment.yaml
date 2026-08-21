@@ -1,0 +1,151 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: upgrade-delta-pr-comment
+  labels: {app.kubernetes.io/part-of: upgrade-delta}
+spec:
+  description: >-
+    Submit a short CAB summary to GitHub: project grade, per-library version /
+    grade / lane / CVEs, and test outcome. Deep reachability and call-chain
+    detail stay on scorecard.html — not in this comment. Runs in `finally`
+    so it comments on RED runs too. Uses .upgrade-delta/pr_comment.py (or
+    integration/github-action/pr_comment.py in the demo repo).
+  params:
+    - name: source-label
+      type: string
+      default: "upgrade-delta"
+      description: >-
+        Shown at the top of the comment so it's obvious which pipeline
+        produced it -- this Task is reused by both the fixture demo and the
+        live pipeline, and both can comment on the same PR.
+    - name: repo-owner
+      type: string
+      default: ""
+    - name: repo-name
+      type: string
+      default: ""
+    - name: pull-request-number
+      type: string
+      default: ""
+    - name: github-api
+      type: string
+      default: "https://api.github.com"
+      description: Change for GitHub Enterprise (e.g. https://ghe.example.com/api/v3)
+    - name: auto-close-pr
+      type: string
+      default: "false"
+      description: >-
+        When "true", close the PR without merging after posting the CAB comment,
+        but only if out/changed-deps.json shows a real version change. Used by the
+        live payments-service demo cycle so main stays on community jackson for the next run.
+  workspaces:
+    - name: source
+    - name: basic-auth
+      description: PaC-provided git auth secret (key git-provider-token). Optional.
+      optional: true
+  steps:
+    - name: comment
+      image: registry.access.redhat.com/ubi9/python-311:latest
+      workingDir: $(workspaces.source.path)
+      script: |
+        #!/usr/bin/env bash
+        set -uo pipefail
+        if [ ! -f out/scorecard.json ]; then
+          echo "no out/scorecard.json — scan did not produce a scorecard; nothing to post."
+          exit 0
+        fi
+
+        # Short CAB comment — reachability detail stays on scorecard.html.
+        SEL_ARGS=()
+        [ -f out/routing-out/selection-report.json ] && \
+          SEL_ARGS+=(--selection out/routing-out/selection-report.json)
+        [ -f out/test-results.json ] && \
+          SEL_ARGS+=(--test-results out/test-results.json)
+        [ -f out/cab-signoff.json ] && \
+          SEL_ARGS+=(--cab-signoff out/cab-signoff.json)
+
+        if [ -f .upgrade-delta/pr_comment.py ]; then
+          RENDER=".upgrade-delta/pr_comment.py"
+        elif [ -f integration/github-action/pr_comment.py ]; then
+          RENDER="integration/github-action/pr_comment.py"
+        else
+          echo "FATAL: pr_comment.py not found under .upgrade-delta/ or integration/github-action/"
+          exit 1
+        fi
+        python3 "$RENDER" out/scorecard.json out/pr-comment.md "${SEL_ARGS[@]}"
+        {
+          echo "### $(params.source-label)"
+          cat out/pr-comment.md
+        } > out/pr-comment.md.tmp && mv out/pr-comment.md.tmp out/pr-comment.md
+        echo "wrote out/pr-comment.md"
+
+        OWNER="$(params.repo-owner)"; REPO="$(params.repo-name)"; PR="$(params.pull-request-number)"
+        TOKEN_FILE="$(workspaces.basic-auth.path)/git-provider-token"
+        if [ -n "$OWNER" ] && [ -n "$REPO" ] && [ -n "$PR" ] && [ -f "$TOKEN_FILE" ]; then
+          echo "Posting CAB comment to $OWNER/$REPO PR #$PR ..."
+          python3 - "$OWNER" "$REPO" "$PR" "$(params.github-api)" "$TOKEN_FILE" <<'PY'
+        import json, sys, urllib.request
+        owner, repo, pr, api, tokfile = sys.argv[1:6]
+        token = open(tokfile).read().strip()
+        body = open("out/pr-comment.md").read()
+        url = f"{api}/repos/{owner}/{repo}/issues/{pr}/comments"
+        req = urllib.request.Request(url, data=json.dumps({"body": body}).encode(),
+                                     method="POST", headers={
+                                         "Authorization": f"Bearer {token}",
+                                         "Accept": "application/vnd.github+json",
+                                         "Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req) as r:
+                print("posted:", r.status, json.loads(r.read()).get("html_url", ""))
+        except Exception as e:
+            print("WARN: could not post comment:", e)
+            print("---- comment body ----"); print(body)
+        PY
+        else
+          echo "No PR token/context — printing the comment instead of posting:"
+          echo "==================== CAB COMMENT ===================="
+          cat out/pr-comment.md
+          echo "===================================================="
+        fi
+
+        # Demo cycle: close PR without merge after a real pom version bump so the
+        # baseline branch stays on community libs for the next ./scripts/demo-live-cycle.sh start.
+        if [ "$(params.auto-close-pr)" = "true" ] \
+           && [ -n "$OWNER" ] && [ -n "$REPO" ] && [ -n "$PR" ] && [ -f "$TOKEN_FILE" ]; then
+          python3 - "$OWNER" "$REPO" "$PR" "$(params.github-api)" "$TOKEN_FILE" <<'PY'
+        import json, os, sys, urllib.request
+        owner, repo, pr, api, tokfile = sys.argv[1:6]
+        token = open(tokfile).read().strip()
+        path = "out/changed-deps.json"
+        if not os.path.isfile(path):
+            print("auto-close-pr: no out/changed-deps.json — skip close")
+            sys.exit(0)
+        d = json.load(open(path))
+        changes = (d.get("changed") or []) if isinstance(d, dict) else (d or [])
+        if not changes:
+            print("auto-close-pr: no version changes detected — leave PR open")
+            sys.exit(0)
+        body = (
+            "🔄 **Demo auto-reset:** closed without merging so the base branch keeps "
+            "community library versions for the next live demo "
+            "(`./scripts/demo-live-cycle.sh start`).\n\n"
+            "Re-open a fresh bump PR when you want to run the cycle again."
+        )
+        for url, payload in (
+            (f"{api}/repos/{owner}/{repo}/issues/{pr}/comments", {"body": body}),
+            (f"{api}/repos/{owner}/{repo}/pulls/{pr}", {"state": "closed"}),
+        ):
+            req = urllib.request.Request(
+                url, data=json.dumps(payload).encode(), method="POST" if "comments" in url else "PATCH",
+                headers={"Authorization": f"Bearer {token}",
+                         "Accept": "application/vnd.github+json",
+                         "Content-Type": "application/json"})
+            try:
+                with urllib.request.urlopen(req) as r:
+                    print("auto-close:", url.split("/")[-1], r.status)
+            except Exception as e:
+                print("WARN: auto-close step failed:", e)
+                sys.exit(0)
+        print(f"auto-close-pr: closed PR #{pr} without merge")
+        PY
+        fi

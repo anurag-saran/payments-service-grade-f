@@ -1,0 +1,42 @@
+{
+  "collected_at_sha": "main",
+  "build": "payments-service-fast-lane",
+  "age_commits": 0,
+  "tests": {
+    "PaymentServiceTest": {
+      "covers": [
+        "com.example.payments.PaymentService",
+        "com.example.payments.Ledger",
+        "com.example.payments.PaymentRequest"
+      ]
+    },
+    "ReportArchiveTest": {
+      "covers": [
+        "com.example.payments.ReportArchive"
+      ]
+    },
+    "GatewayClientTest": {
+      "covers": [
+        "com.example.payments.GatewayClient"
+      ]
+    },
+    "LedgerTest": {
+      "covers": [
+        "com.example.payments.Ledger"
+      ]
+    },
+    "RefundServiceTest": {
+      "covers": [
+        "com.example.payments.RefundService",
+        "com.example.payments.PaymentService",
+        "com.example.payments.Ledger"
+      ]
+    },
+    "BootSmokeIT": {
+      "covers": [
+        "com.example.payments.PaymentsApplication"
+      ]
+    }
+  },
+  "_note": "Fast-lane coverage map for Lightwell remediations (jackson / commons-io / httpclient). Regenerate with jacoco2coverage.py after major refactors."
+}

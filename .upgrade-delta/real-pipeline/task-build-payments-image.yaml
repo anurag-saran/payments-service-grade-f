@@ -1,0 +1,71 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: build-payments-image
+spec:
+  description: >-
+    Build payments-service via an OpenShift Docker strategy BuildConfig
+    (binary start-build) and tag the result as :canary. Avoids privileged
+    buildah on restricted clusters.
+  params:
+    - name: namespace
+      type: string
+      default: "upgrade-delta-demo"
+    - name: build-name
+      type: string
+      default: "payments-service"
+    - name: canary-tag
+      type: string
+      default: "canary"
+    - name: revision-tag
+      type: string
+      default: ""
+  results:
+    - name: IMAGE_DIGEST
+      description: ImageStream tag reference for the canary
+  workspaces:
+    - name: source
+  steps:
+    - name: build-and-tag
+      image: registry.redhat.io/openshift4/ose-cli:latest
+      workingDir: $(workspaces.source.path)
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+        NS="$(params.namespace)"
+        NAME="$(params.build-name)"
+        TAG="$(params.canary-tag)"
+        REG="image-registry.openshift-image-registry.svc:5000/${NS}/${NAME}"
+
+        # Ensure ImageStream has a resolvable dockerImageRepository. Without it,
+        # Binary Docker builds fail with InvalidOutputReference on empty clusters.
+        if ! oc -n "$NS" get imagestream "$NAME" >/dev/null 2>&1; then
+          oc -n "$NS" create imagestream "$NAME"
+        fi
+        oc -n "$NS" patch imagestream "$NAME" --type=merge \
+          -p "{\"spec\":{\"dockerImageRepository\":\"${REG}\"}}" >/dev/null
+
+        if ! oc -n "$NS" get buildconfig "$NAME" >/dev/null 2>&1; then
+          echo "Creating BuildConfig $NAME (Docker strategy → ${NAME}:${TAG})"
+          oc -n "$NS" new-build --strategy=docker --binary --name="$NAME" \
+            --to="${NAME}:${TAG}"
+        fi
+        # Keep output on the ImageStreamTag even if BC was created earlier broken.
+        oc -n "$NS" patch buildconfig "$NAME" --type=merge -p "{
+          \"spec\":{\"output\":{\"to\":{\"kind\":\"ImageStreamTag\",\"name\":\"${NAME}:${TAG}\"}}},
+          \"source\":{\"type\":\"Binary\",\"binary\":{}}
+        }" >/dev/null || true
+
+        echo "Starting binary build from workspace…"
+        oc -n "$NS" start-build "$NAME" --from-dir=. --follow --wait
+
+        oc -n "$NS" tag "${NAME}:${TAG}" "${NAME}:${TAG}" 2>/dev/null || true
+        if [ -n "$(params.revision-tag)" ]; then
+          oc -n "$NS" tag "${NAME}:${TAG}" "${NAME}:$(params.revision-tag)" || true
+        fi
+
+        REF="${REG}:${TAG}"
+        RESOLVED=$(oc -n "$NS" get istag "${NAME}:${TAG}" -o jsonpath='{.image.dockerImageReference}' 2>/dev/null || true)
+        [ -n "$RESOLVED" ] && REF="$RESOLVED"
+        printf '%s' "$REF" > "$(results.IMAGE_DIGEST.path)"
+        echo "IMAGE=$REF"

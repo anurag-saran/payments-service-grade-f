@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Optional. The payments-service pom uses only the public Lightwell demo Maven
+     feeds (no auth). Copy this only if you also resolve other authenticated
+     Red Hat repositories outside this demo.
+
+     Public demos (no credentials):
+       https://console.redhat.com/lightwell/demo/java-remediated-demo
+       https://console.redhat.com/lightwell/demo/java-validated-demo
+       https://packages.redhat.com/lightwell/public-lightwell-demo/java/...
+-->
+<settings xmlns="http://maven.apache.org/SETTINGS/1.0.0">
+  <mirrors/>
+</settings>

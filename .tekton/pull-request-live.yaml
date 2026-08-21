@@ -1,0 +1,78 @@
+# Live pipeline trigger for payments-service-grade-f (snakeyaml 1.30 → 1.33 → grade F).
+# Dedicated PVC so reports are never overwritten by with-tests / notests / grade-c lanes.
+# Expected: headline F → grade-gate FAILS (fail-on D). That is the demo.
+#
+# Demo cycle: ./scripts/demo-live-cycle.sh start | finish
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  annotations:
+    pipelinesascode.tekton.dev/on-event: "[pull_request]"
+    pipelinesascode.tekton.dev/on-target-branch: "[main]"
+    pipelinesascode.tekton.dev/max-keep-runs: "5"
+    pipelinesascode.tekton.dev/pipeline: ".upgrade-delta/real-pipeline/pipeline-real.yaml"
+    pipelinesascode.tekton.dev/task: "git-clone"
+    pipelinesascode.tekton.dev/task-1: ".upgrade-delta/real-pipeline/task-detect-pom-changes.yaml"
+    pipelinesascode.tekton.dev/task-2: ".upgrade-delta/real-pipeline/task-live-coverage.yaml"
+    pipelinesascode.tekton.dev/task-3: ".upgrade-delta/real-pipeline/task-generate-evidence.yaml"
+    pipelinesascode.tekton.dev/task-4: ".upgrade-delta/real-pipeline/task-run-tests-maven.yaml"
+    pipelinesascode.tekton.dev/task-5: ".upgrade-delta/real-pipeline/task-upgrade-delta-select-tests.yaml"
+    pipelinesascode.tekton.dev/task-6: ".upgrade-delta/real-pipeline/task-upgrade-delta-summary.yaml"
+    pipelinesascode.tekton.dev/task-7: ".upgrade-delta/real-pipeline/task-upgrade-delta-pr-comment.yaml"
+    pipelinesascode.tekton.dev/task-8: ".upgrade-delta/real-pipeline/task-resolve-and-grade-transitive.yaml"
+    pipelinesascode.tekton.dev/task-9: ".upgrade-delta/real-pipeline/task-cab-decision.yaml"
+    pipelinesascode.tekton.dev/task-10: ".upgrade-delta/real-pipeline/task-build-payments-image.yaml"
+    pipelinesascode.tekton.dev/task-11: ".upgrade-delta/real-pipeline/task-canary-rollout.yaml"
+  name: upgrade-delta-live-pr-gradef
+spec:
+  pipelineRef:
+    name: upgrade-delta-live
+  params:
+    - name: git-url
+      value: '{{ repo_url }}'
+    - name: git-revision
+      value: '{{ revision }}'
+    - name: target-branch
+      value: '{{ target_branch }}'
+    - name: pom-path
+      value: 'pom.xml'
+    - name: app-name
+      value: 'payments-service-grade-f'
+    - name: app-module-dir
+      value: '.'
+    - name: fail-on
+      value: 'D'
+    - name: accept-transitive-scope
+      value: 'false'
+    - name: coverage-map
+      value: 'coverage-map.json'
+    - name: tests-dir
+      value: 'src/test/java'
+    - name: repo-owner
+      value: '{{ repo_owner }}'
+    - name: repo-name
+      value: '{{ repo_name }}'
+    - name: pull-request-number
+      value: '{{ pull_request_number }}'
+    - name: scorecard-route-host
+      value: 'scorecard-gradef-upgrade-delta-demo.apps.asaran.na-launch.com'
+    - name: auto-close-pr
+      value: 'false'
+    - name: enable-canary
+      value: 'false'
+    - name: canary-namespace
+      value: 'upgrade-delta-demo'
+    - name: canary-soak-seconds
+      value: '30'
+    - name: cab-timeout-seconds
+      value: '1800'
+  workspaces:
+    - name: source
+      persistentVolumeClaim:
+        claimName: upgrade-delta-live-reports-gradef
+    - name: maven-settings
+      secret:
+        secretName: lightwell-maven-settings
+    - name: basic-auth
+      secret:
+        secretName: "{{ git_auth_secret }}"

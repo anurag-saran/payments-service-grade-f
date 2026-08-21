@@ -1,0 +1,71 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: upgrade-delta-run-tests
+spec:
+  description: >-
+    Actually RUNS the tests upgrade-delta-select-tests picked -- a real JVM
+    executes every class named in surefire-includes.txt. Writes
+    out/test-results.json (pass/fail + per-library attribution) BEFORE any
+    grade-gate exit so the finally scorecard re-render still sees outcomes.
+    A genuine test failure fails this task (exit 1).
+  workspaces:
+    - name: source
+  results:
+    - name: TEST_METHODS_PASSED_COUNT
+      description: "Test METHODS that were EXECUTED and passed"
+    - name: TEST_METHODS_FAILED_COUNT
+      description: "Test METHODS that were executed and FAILED. 0 = all green. Any non-zero value turns this PipelineRun red."
+    - name: TESTS_ACTUALLY_EXECUTED_SUMMARY
+      description: "One human-readable sentence confirming tests were run (not just counted) and the pass/fail result"
+  steps:
+    - name: run
+      displayName: "RUN the selected tests for real (JVM)"
+      image: registry.access.redhat.com/ubi9/openjdk-21:latest
+      workingDir: $(workspaces.source.path)
+      script: |
+        #!/usr/bin/env bash
+        set -uo pipefail
+        # App + tests jars, plus runtime deps under lib/ (jackson, snakeyaml, …).
+        CP=$(ls examples/demo-jars/*.jar examples/demo-jars/lib/*.jar 2>/dev/null | tr '\n' ':')
+        java -cp "$CP" testing.MiniRunner out/routing-out/surefire-includes.txt | tee /tmp/exec.log
+        # Prefer MiniRunner's summary line; fall back to counting PASS/FAIL lines.
+        PASSED=$(grep -cE '^[[:space:]]*PASS[[:space:]]' /tmp/exec.log || true)
+        FAILED=$(grep -cE '^[[:space:]]*FAIL[[:space:]]' /tmp/exec.log || true)
+        PASSED=${PASSED:-0}; FAILED=${FAILED:-0}
+        EXECUTED=$((PASSED + FAILED))
+        printf '%s' "$PASSED"  > "$(results.TEST_METHODS_PASSED_COUNT.path)"
+        printf '%s' "$FAILED"  > "$(results.TEST_METHODS_FAILED_COUNT.path)"
+        if [ "$FAILED" -eq 0 ] && [ "$EXECUTED" -gt 0 ]; then
+          SUMMARY=$(printf 'Ran %s test method(s) for real in this JVM -- all passed, 0 failed.' "$EXECUTED")
+        elif [ "$EXECUTED" -eq 0 ]; then
+          SUMMARY='MiniRunner produced no PASS/FAIL lines — 0 tests recorded.'
+        else
+          SUMMARY=$(printf 'Ran %s test method(s) for real in this JVM -- %s FAILED (see this task'"'"'s logs).' "$EXECUTED" "$FAILED")
+        fi
+        printf '%s' "$SUMMARY" > "$(results.TESTS_ACTUALLY_EXECUTED_SUMMARY.path)"
+        echo "executed=$EXECUTED passed=$PASSED failed=$FAILED"
+
+        # Parse MiniRunner "  FAIL Class.method -> …" lines.
+        FAIL_ARGS=()
+        while IFS= read -r line; do
+          name=$(echo "$line" | sed -E 's/^[[:space:]]*FAIL[[:space:]]+//; s/[[:space:]]*->.*//; s/#/./')
+          [ -n "$name" ] && FAIL_ARGS+=(--failed-name "$name")
+        done < <(grep -E '^[[:space:]]*FAIL[[:space:]]' /tmp/exec.log || true)
+
+        UD=upgrade_delta.py
+        [ -f .upgrade-delta/upgrade_delta.py ] && UD=.upgrade-delta/upgrade_delta.py
+        ATTR=()
+        [ -f out/routing.json ] && ATTR+=(--routing out/routing.json)
+        COV=examples/tests/coverage.json
+        [ -f "$COV" ] && ATTR+=(--coverage "$COV")
+        python3 "$UD" record-test-results \
+          --out out/test-results.json \
+          --passed "$PASSED" --failed "$FAILED" \
+          --summary "$SUMMARY" --status ran \
+          --selection out/routing-out/selection-report.json \
+          --scorecard out/scorecard.json \
+          "${ATTR[@]+"${ATTR[@]}"}" \
+          "${FAIL_ARGS[@]+"${FAIL_ARGS[@]}"}"
+
+        [ "$FAILED" -eq 0 ] || { echo "GATE: $FAILED test method(s) failed"; exit 1; }
