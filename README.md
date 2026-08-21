@@ -1,10 +1,16 @@
 # payments-service-grade-f
 
+[![Lightwell library updates](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fanurag-saran%2Fpayments-service-grade-f%2Flightwell%2Fbadge%2Flightwell-badge.json&v=2)](https://github.com/anurag-saran/payments-service-grade-f/pulls?q=is%3Apr+is%3Aopen+label%3Alightwell)
+
 Sibling of **[payments-service](https://github.com/anurag-saran/payments-service)** for the
 **grade F / reachable break** live demo. Same app sources (including `ConfigLoader`
 calling the snakeyaml constructor removed in 1.33), tests, Dockerfile, and deploy
 manifests — used so upgrade-delta can show a **community** minor bump that headlines
 **F** and **fails** `fail-on: D`.
+
+Remediations come from the
+**[Lightwell GitHub plugin](https://github.com/anurag-saran/lightwell-github-plugin-demo)**
+(badge sync checks out that repo).
 
 Not a production payments product. Package: `com.example.payments`.
 
