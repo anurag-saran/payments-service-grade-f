@@ -36,7 +36,7 @@
     <httpclient.version>4.5.12</httpclient.version>
     <json-path.version>2.7.0</json-path.version>
     <!-- Deliberately pre-1.33 community so ConfigLoader's removed constructor stays reachable. -->
-    <snakeyaml.version>1.30</snakeyaml.version>
+    <snakeyaml.version>1.33</snakeyaml.version>
   </properties>
 
   <repositories>
@@ -213,7 +213,7 @@
         <commons-io.version>2.11.0</commons-io.version>
         <httpclient.version>4.5.12</httpclient.version>
         <json-path.version>2.7.0</json-path.version>
-        <snakeyaml.version>1.30</snakeyaml.version>
+        <snakeyaml.version>1.33</snakeyaml.version>
       </properties>
     </profile>
   </profiles>
